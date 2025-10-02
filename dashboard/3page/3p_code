@@ -1,0 +1,636 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import datetime
+import shap
+from sklearn.inspection import PartialDependenceDisplay, partial_dependence
+from shiny import ui, render, reactive
+from common import get_kr_name
+
+def create_group_ui(group_name, features, data):
+    """입력 그룹 UI 생성"""
+    feature_stats = data['feature_stats']
+    mold_choices = data['mold_code_choices']
+    working_choices = data['working_choices']
+    
+    ui_elements = [ui.h4(group_name, style="margin-bottom: 15px; font-weight: bold;")]
+    
+    if group_name == "4. 설비 상태 및 식별 그룹":
+        ui_elements.extend([
+            ui.input_select("mold_code", get_kr_name("mold_code"), 
+                          choices=mold_choices, 
+                          selected=mold_choices[0] if mold_choices else None),
+            ui.input_select("working", get_kr_name("working"), 
+                          choices=working_choices, 
+                          selected='가동'),
+        ])
+        ui_elements.append(
+            ui.input_select("heating_furnace", get_kr_name("heating_furnace"), 
+                          choices=["A", "B", "C"], selected='A', selectize=True)
+        )
+        ui_elements.append(
+            ui.input_select("tryshot_signal", get_kr_name("tryshot_signal"), 
+                          choices=["A", "D"], selected='A', selectize=True)
+        )
+    
+    for col in features:
+        if col in feature_stats:
+            stats = feature_stats[col]
+            ui_elements.append(
+                ui.card(
+                    ui.card_header(get_kr_name(col), 
+                                 style="padding: 5px 10px; font-size: 0.9rem; font-weight: bold;"),
+                    ui.row(
+                        ui.column(8, ui.input_slider(
+                            id=f"{col}_slider", 
+                            label="", 
+                            min=stats['min'], 
+                            max=stats['max'], 
+                            value=stats['value'],
+                            step=1
+                        ), class_="slider-col-card"),
+                        ui.column(4, ui.input_numeric(
+                            id=col, 
+                            label="", 
+                            min=stats['min'], 
+                            max=stats['max'], 
+                            value=stats['value']
+                        ), class_="numeric-col-card"),
+                        class_="input-row-card"
+                    ), 
+                    style="margin-bottom: 10px; padding: 0;"
+                )
+            )
+        else:
+            ui_elements.append(
+                ui.div(f"**경고: {get_kr_name(col)} 데이터 누락**", class_="text-warning")
+            )
+    
+    return ui.div(*ui_elements)
+
+def create_prediction_ui(data):
+    """예측&개선 탭 UI 생성"""
+    groups = {
+        "1. 온도 관련 그룹": ["molten_temp", "upper_mold_temp1", "lower_mold_temp1", 
+                         "upper_mold_temp2", "lower_mold_temp2", "sleeve_temperature", 
+                         "Coolant_temperature"],
+        "2. 압력 및 속도 그룹": ["cast_pressure", "physical_strength", 
+                            "low_section_speed", "high_section_speed"],
+        "3. 계량 및 시간 그룹": ["molten_volume", "biscuit_thickness", 
+                            "facility_operation_cycleTime", "production_cycletime", "hour"],
+        "4. 설비 상태 및 식별 그룹": ["count", "EMS_operation_time"]
+    }
+    
+    group_uis = [create_group_ui(name, feats, data) for name, feats in groups.items()]
+    numerical_feats = data['numerical_features']
+    
+    return ui.nav_panel(
+        "예측&개선",
+        ui.h3("주조 공정 데이터 기반 불량 예측 모델"),
+        ui.hr(),
+        ui.panel_conditional(
+            "false" if data['data_status']['DATA_PRED_LOADED'] else "true",
+            ui.div(ui.h4("오류: 데이터 파일을 찾을 수 없습니다."), class_="alert alert-danger")
+        ),
+        ui.panel_conditional(
+            "false" if data['data_status']['MODEL_LOADED'] else "true",
+            ui.div(ui.h4("경고: 모델 파일을 찾을 수 없습니다."), 
+                  ui.p("예측 기능을 사용할 수 없습니다."), class_="alert alert-warning")
+        ),
+        ui.layout_column_wrap(1 / 4, fill=False, *group_uis),
+        ui.hr(style="margin-top: 20px; margin-bottom: 20px;"),
+        ui.row(
+            ui.column(4, 
+                ui.h4("예측 결과"), 
+                ui.output_ui("prediction_output_ui"), 
+                ui.input_action_button("predict_button", "예측하기", 
+                                     class_="btn-primary btn-lg mt-2 w-100")
+            ),
+            ui.column(8, 
+                ui.h4("실제 불량 여부 확인 및 피드백"), 
+                ui.row(
+                    ui.column(4, 
+                        ui.div("실제 상태:", style="font-weight: bold; margin-bottom: 5px;"), 
+                        ui.input_action_button("correct_btn", "✅ 불량 맞음 (Correct)", 
+                                             class_="btn-success w-100"), 
+                        ui.input_action_button("incorrect_btn", "❌ 불량 아님 (Incorrect)", 
+                                             class_="btn-danger mt-2 w-100")
+                    ), 
+                    ui.column(8, 
+                        ui.div("원인 메모:", style="font-weight: bold; margin-bottom: 5px;"), 
+                        ui.input_text("feedback", "", 
+                                    placeholder="예: 냉각수온도(Coolant_temperature) 급변", 
+                                    width="100%"), 
+                        ui.input_action_button("submit_btn", "💾 피드백 저장", 
+                                             class_="btn-primary w-100 mt-2")
+                    )
+                ), 
+                ui.div(ui.output_text("selected_status"), 
+                      style="margin-top: 10px; font-weight: bold;")
+            ),
+        ),
+        ui.hr(style="margin-top: 20px; margin-bottom: 20px;"),
+        ui.h3("누적 피드백 데이터"),
+        ui.output_ui("feedback_table"),
+        ui.hr(style="margin-top: 20px; margin-bottom: 20px;"),
+        ui.h4("SHAP Bar Plot - 개별 예측 설명 (상위 5개 변수)"),
+        ui.p("입력된 변수값이 예측 결과에 어떻게 영향을 미치는지 시각화합니다."),
+        ui.output_plot("shap_bar_plot", height="400px"),
+        ui.output_ui("shap_interpretation"),
+        ui.hr(style="margin-top: 20px; margin-bottom: 20px;"),
+        ui.h4("PDP (Partial Dependence Plot) - 변수별 영향도 분석"),
+        ui.p("특정 변수의 값 변화가 불량 예측에 미치는 영향을 분석합니다."),
+        ui.input_select("pdp_variable_selector", "PDP 분석 변수 선택", 
+                       choices={k: get_kr_name(k) for k in numerical_feats}, 
+                       selected="sleeve_temperature"),
+        ui.output_plot("prediction_pdp_plot", height="400px"),
+        ui.output_ui("pdp_recommendation"),
+    )
+
+def create_prediction_server(data):
+    """예측&개선 탭 서버 로직"""
+    
+    def server_logic(input, output, session):
+        # 반응형 값들
+        r_prediction_text = reactive.Value("예측 버튼을 눌러주세요.")
+        r_correct_status = reactive.Value(None)
+        r_feedback_data = reactive.Value(pd.DataFrame(columns=["Time", "Prediction", "Correct", "Feedback"]))
+        r_prediction_result = reactive.Value(None)
+        r_shap_data = reactive.Value(None)
+        r_current_input = reactive.Value(None)
+        r_pdp_rec_range = reactive.Value(None)
+        r_top_shap_feature = reactive.Value(None)
+        
+        # 슬라이더와 입력 동기화
+        for col in data['numerical_features']:
+            def make_sync_observer(feature_name):
+                slider_id, numeric_id = f"{feature_name}_slider", feature_name
+                @reactive.Effect
+                @reactive.event(input[slider_id])
+                def _(): 
+                    ui.update_numeric(numeric_id, value=input[slider_id]())
+                @reactive.Effect
+                @reactive.event(input[numeric_id])
+                def _():
+                    if input[slider_id]() != input[numeric_id](): 
+                        ui.update_slider(slider_id, value=input[numeric_id]())
+            make_sync_observer(col)
+        
+        # 예측 실행
+        @reactive.Effect
+        @reactive.event(input.predict_button)
+        def run_prediction():
+            r_correct_status.set(None)
+            r_prediction_result.set(None)
+            r_prediction_text.set("⏳ 모델 예측 중...")
+            r_shap_data.set(None)
+            r_pdp_rec_range.set(None)
+            
+            if not data['data_status']['DATA_PRED_LOADED'] or not data['data_status']['MODEL_LOADED']:
+                r_prediction_text.set("예측 불가: 파일/모델 오류")
+                r_prediction_result.set("WARNING")
+                return
+            
+            try:
+                with reactive.isolate():
+                    working_numeric = {'가동': 1, '정지': 0}.get(input.working())
+                    mold_code_value = input.mold_code()
+                    try:
+                        mold_code_numeric = int(mold_code_value)
+                    except ValueError:
+                        mold_code_numeric = mold_code_value
+                    
+                    all_slider_features = data['numerical_features'] + ['hour']
+                    input_data_dict = {}
+                    
+                    for col in all_slider_features:
+                        if col in input:
+                            input_data_dict[col] = input[col]()
+                    
+                    input_data_dict['mold_code'] = mold_code_numeric
+                    input_data_dict['working'] = working_numeric
+                    
+                    heating_furnace_map = {'A': 0, 'B': 1, 'C': 2}
+                    tryshot_signal_map = {'A': 0, 'D': 1}
+                    input_data_dict['heating_furnace'] = heating_furnace_map.get(input.heating_furnace())
+                    input_data_dict['tryshot_signal'] = tryshot_signal_map.get(input.tryshot_signal())
+                    
+                    input_df = pd.DataFrame([input_data_dict])
+                    prediction = data['pipeline'].predict(input_df)
+                    prediction_proba = data['pipeline'].predict_proba(input_df)
+                    
+                    preprocessor = data['pipeline'].named_steps["preprocessor"]
+                    classifier = data['pipeline'].named_steps["classifier"]
+                    X_custom = preprocessor.transform(input_df)
+                    feature_names_out = list(preprocessor.get_feature_names_out())
+                    
+                    explainer = shap.TreeExplainer(classifier)
+                    shap_values = explainer.shap_values(X_custom)
+                    
+                    if isinstance(shap_values, list):
+                        shap_values_class1 = shap_values[1][0, :]
+                    else:
+                        shap_values_class1 = shap_values[0, :]
+                    
+                    abs_shap = np.abs(shap_values_class1)
+                    top5_idx = np.argsort(abs_shap)[-5:][::-1]
+                    
+                    shap_data = {
+                        'shap_values': shap_values_class1[top5_idx],
+                        'feature_values': X_custom[0, top5_idx],
+                        'feature_names': [feature_names_out[i] for i in top5_idx]
+                    }
+                    r_shap_data.set(shap_data)
+                    
+                    top_feature_transformed = feature_names_out[top5_idx[0]]
+                    top_feature_original = top_feature_transformed.split('__')[-1] if '__' in top_feature_transformed else top_feature_transformed
+                    
+                    if top_feature_original in data['numerical_features']:
+                        r_top_shap_feature.set(top_feature_original)
+                
+                r_current_input.set(input_df)
+                
+                if prediction[0] == 0:
+                    prob = prediction_proba[0][0] * 100
+                    result_text = f"✅ 정상 (양품)일 확률: {prob:.2f}%"
+                    result_class = "success"
+                else:
+                    prob = prediction_proba[0][1] * 100
+                    result_text = f"🚨 불량일 확률: {prob:.2f}%"
+                    result_class = "danger"
+                
+                r_prediction_text.set(result_text)
+                r_prediction_result.set(result_class)
+                
+            except Exception as e:
+                r_prediction_text.set(f"예측 중 오류: {e}")
+                r_prediction_result.set("WARNING")
+                print(f"예측 오류 상세: {e}")
+        
+        @output
+        @render.ui
+        def prediction_output_ui():
+            result_class, text = r_prediction_result(), r_prediction_text()
+            if result_class is None:
+                return ui.div(ui.h5(text), class_="alert alert-info" if "예측 버튼" in text else "alert alert-secondary")
+            final_class = {
+                "success": "alert alert-success", 
+                "danger": "alert alert-danger", 
+                "WARNING": "alert alert-warning"
+            }.get(result_class, "alert alert-warning")
+            return ui.div(ui.h5(text), class_=final_class)
+        
+        @reactive.Effect
+        @reactive.event(input.correct_btn)
+        def set_correct():
+            r_correct_status.set("✅ 불량 맞음")
+        
+        @reactive.Effect
+        @reactive.event(input.incorrect_btn)
+        def set_incorrect():
+            r_correct_status.set("❌ 불량 아님")
+        
+        @output
+        @render.text
+        def selected_status():
+            return f">> 현재 선택된 상태: {r_correct_status()}" if r_correct_status() else ">> 불량 여부를 선택해주세요."
+        
+        @reactive.Effect
+        def update_pdp_selector():
+            top_feature = r_top_shap_feature()
+            if top_feature and top_feature in data['numerical_features']:
+                ui.update_select("pdp_variable_selector", selected=top_feature)
+        
+        @reactive.Effect
+        @reactive.event(input.submit_btn)
+        def save_feedback():
+            prediction_text, correct_status = r_prediction_text(), r_correct_status()
+            if correct_status is None or any(s in prediction_text for s in ["예측 버튼", "예측 불가", "모델 예측 중"]):
+                ui.notification_show("🚨 예측 수행 후 실제 불량 여부를 선택해야 피드백 저장이 가능합니다.", 
+                                   duration=5, type="warning")
+                return
+            
+            prediction_only = "불량" if "불량일 확률" in prediction_text else "정상"
+            new_feedback = pd.DataFrame({
+                "Time": [datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')],
+                "Prediction": [prediction_only],
+                "Correct": [correct_status],
+                "Feedback": [input.feedback()]
+            })
+            r_feedback_data.set(pd.concat([r_feedback_data(), new_feedback], ignore_index=True))
+            r_correct_status.set(None)
+            ui.update_text("feedback", value="")
+            ui.notification_show("✅ 피드백이 성공적으로 저장되었습니다.", duration=3, type="success")
+        
+        @output
+        @render.ui
+        def feedback_table():
+            df_feedback = r_feedback_data()
+            if df_feedback.empty:
+                return ui.p("아직 저장된 피드백이 없습니다.")
+            
+            header = ui.tags.tr(*[ui.tags.th(col) for col in df_feedback.columns])
+            rows = []
+            for _, row in df_feedback.iterrows():
+                correct_text = str(row['Correct'])
+                correct_style = ""
+                if "맞음" in correct_text:
+                    correct_style = "background-color: #d4edda; color: #155724;"
+                elif "아님" in correct_text:
+                    correct_style = "background-color: #f8d7da; color: #721c24;"
+                
+                tds = [
+                    ui.tags.td(str(row['Time'])),
+                    ui.tags.td(str(row['Prediction'])),
+                    ui.tags.td(correct_text, style=correct_style),
+                    ui.tags.td(str(row['Feedback']))
+                ]
+                rows.append(ui.tags.tr(*tds))
+            
+            return ui.tags.div(
+                ui.tags.style("""
+                    table.custom-table { width: 100%; border-collapse: collapse; }
+                    .custom-table th, .custom-table td { border: 1px solid #ccc; padding: 8px; text-align: center; }
+                    .custom-table th { background-color: #f5f5f5; }
+                """),
+                ui.tags.table({"class": "custom-table"}, ui.tags.thead(header), ui.tags.tbody(*rows))
+            )
+        
+        # SHAP Bar Plot 및 해석
+        @output
+        @render.plot
+        def shap_bar_plot():
+            shap_data = r_shap_data()
+            if shap_data is None:
+                fig, ax = plt.subplots(figsize=(10, 4))
+                ax.text(0.5, 0.5, "예측 버튼을 눌러 SHAP Bar Plot을 생성하세요", 
+                       ha='center', va='center', fontsize=12, color='gray')
+                ax.axis('off')
+                return fig
+            
+            try:
+                shap_values = shap_data['shap_values']
+                feature_names_list = shap_data['feature_names']
+                
+                fig, ax = plt.subplots(figsize=(9, 4))
+                colors = ['red' if val > 0 else 'blue' for val in shap_values]
+                bars = ax.barh(range(len(shap_values)), shap_values, color=colors, alpha=0.7)
+                
+                ax.set_yticks(range(len(feature_names_list)))
+                ax.set_yticklabels(feature_names_list, fontsize=10)
+                ax.set_xlabel('SHAP 값 (불량 예측에 대한 기여도)', fontsize=11)
+                ax.set_title('SHAP Bar Plot - 상위 5개 영향 변수', fontsize=13, pad=10)
+                ax.axvline(x=0, color='black', linestyle='-', linewidth=0.8)
+                ax.grid(axis='x', alpha=0.3)
+                
+                for i, (bar, val) in enumerate(zip(bars, shap_values)):
+                    ax.text(val/2, i, f'{val:.3f}', va='center', ha='center', 
+                           fontsize=9, color='white', fontweight='bold')
+                
+                plt.tight_layout(pad=0.5)
+                return fig
+            except Exception as e:
+                fig, ax = plt.subplots(figsize=(10, 4))
+                ax.text(0.5, 0.5, f"Bar Plot 생성 오류: {str(e)}", 
+                       ha='center', va='center', fontsize=10, color='red')
+                ax.axis('off')
+                return fig
+        
+        @output
+        @render.ui
+        def shap_interpretation():
+            shap_data = r_shap_data()
+            prediction_result = r_prediction_result()
+            
+            if shap_data is None or prediction_result is None:
+                return ui.div()
+            
+            try:
+                shap_values = shap_data['shap_values']
+                feature_names_list = shap_data['feature_names']
+                
+                abs_shap = np.abs(shap_values)
+                top_idx = np.argmax(abs_shap)
+                top_feature = feature_names_list[top_idx]
+                top_shap_value = shap_values[top_idx]
+                
+                def sigmoid(x):
+                    return 1 / (1 + np.exp(-x))
+                
+                baseline_prob = sigmoid(0) * 100
+                adjusted_prob = sigmoid(top_shap_value) * 100
+                prob_change = adjusted_prob - baseline_prob
+                
+                if prediction_result == "danger":
+                    if top_shap_value > 0:
+                        interpretation = f"""
+                        **SHAP 값 해석:**
+                        
+                        예측 결과는 **불량**이며, 가장 큰 영향을 미친 변수는 **{top_feature}**입니다.
+                        
+                        - **SHAP 값**: {top_shap_value:.4f}
+                        - **영향**: 이 변수가 불량 확률을 약 **{abs(prob_change):.2f}%p** 증가시켰습니다.
+                        - **해석**: {top_feature}의 현재 값이 불량 예측에 가장 크게 기여했습니다.
+                        
+                        **개선 제안**: {top_feature}의 값을 조정하면 불량 확률을 낮출 수 있습니다.
+                        """
+                    else:
+                        interpretation = f"""
+                        **SHAP 값 해석:**
+                        
+                        예측 결과는 **불량**이지만, **{top_feature}**는 양품 방향으로 작용했습니다.
+                        
+                        - **SHAP 값**: {top_shap_value:.4f}
+                        - **영향**: 이 변수가 양품 확률을 약 **{abs(prob_change):.2f}%p** 증가시키려 했으나, 
+                          다른 변수들의 영향으로 최종 예측은 불량입니다.
+                        - **해석**: {top_feature}는 긍정적이나 다른 변수들을 개선해야 합니다.
+                        """
+                else:
+                    if top_shap_value < 0:
+                        interpretation = f"""
+                        **SHAP 값 해석:**
+                        
+                        예측 결과는 **정상(양품)**이며, 가장 큰 영향을 미친 변수는 **{top_feature}**입니다.
+                        
+                        - **SHAP 값**: {top_shap_value:.4f}
+                        - **영향**: 이 변수가 정상 확률을 약 **{abs(prob_change):.2f}%p** 증가시켰습니다.
+                        - **해석**: {top_feature}의 현재 값이 양품 예측에 가장 크게 기여했습니다.
+                        
+                        ✅ **현재 상태 유지**: {top_feature}의 현재 값을 유지하는 것이 좋습니다.
+                        """
+                    else:
+                        interpretation = f"""
+                        **SHAP 값 해석:**
+                        
+                        예측 결과는 **정상(양품)**이지만, **{top_feature}**는 불량 방향으로 작용했습니다.
+                        
+                        - **SHAP 값**: {top_shap_value:.4f}
+                        - **영향**: 이 변수가 불량 확률을 약 **{abs(prob_change):.2f}%p** 증가시키려 했으나, 
+                          다른 변수들의 긍정적 영향으로 최종 예측은 양품입니다.
+                        - **해석**: 다른 변수들이 우수하나 {top_feature}는 개선 여지가 있습니다.
+                        """
+                
+                return ui.div(ui.markdown(interpretation), class_="alert alert-info", 
+                            style="margin-top: 15px; margin-bottom: 20px;")
+            except Exception as e:
+                return ui.div(ui.p(f"SHAP 해석 생성 중 오류 발생: {str(e)}"), class_="alert alert-warning")
+        
+        # PDP Plot 및 권장사항
+        @output
+        @render.plot
+        def prediction_pdp_plot():
+            current_input = r_current_input()
+            
+            if current_input is None or not data['data_status']['MODEL_LOADED']:
+                fig, ax = plt.subplots(figsize=(10, 4))
+                ax.text(0.5, 0.5, "예측 버튼을 먼저 눌러주세요", ha='center', va='center', fontsize=12, color='gray')
+                ax.axis('off')
+                return fig
+            
+            try:
+                selected_var = input.pdp_variable_selector()
+                current_val = current_input[selected_var].values[0]
+                
+                if selected_var in data['df_pred'].columns:
+                    var_min = data['df_pred'][selected_var].min()
+                    var_max = data['df_pred'][selected_var].max()
+                else:
+                    var_stats = data['feature_stats'].get(selected_var, {})
+                    var_min = var_stats.get('min', current_val - 10)
+                    var_max = var_stats.get('max', current_val + 10)
+                
+                n_samples = 100
+                X_pdp = pd.concat([current_input] * n_samples, ignore_index=True)
+                X_pdp[selected_var] = np.linspace(var_min, var_max, n_samples)
+                
+                GRID = 50
+                display = PartialDependenceDisplay.from_estimator(
+                    estimator=data['pipeline'],
+                    X=X_pdp,
+                    features=[selected_var],
+                    kind='average',
+                    grid_resolution=GRID,
+                    response_method="predict_proba"
+                )
+                ax = display.axes_[0, 0]
+                
+                pd_res = partial_dependence(
+                    estimator=data['pipeline'],
+                    X=X_pdp,
+                    features=[selected_var],
+                    kind='average',
+                    grid_resolution=GRID,
+                    response_method="predict_proba"
+                )
+                
+                xx = np.asarray(pd_res["grid_values"][0])
+                yy = np.asarray(pd_res["average"][0])
+                
+                y_range = float(yy.max() - yy.min())
+                EPS = y_range * 0.01
+                ymin = float(yy.min())
+                mask_good = yy <= (ymin + EPS)
+                
+                good_lo, good_hi = None, None
+                if mask_good.any():
+                    idx = np.where(mask_good)[0]
+                    closest_good_idx_in_idx = np.argmin(np.abs(xx[idx] - current_val))
+                    target_idx = idx[closest_good_idx_in_idx]
+                    
+                    splits = np.where(np.diff(idx) != 1)[0] + 1
+                    runs = np.split(idx, splits)
+                    
+                    best_run = None
+                    for run in runs:
+                        if target_idx in run:
+                            best_run = run
+                            break
+                    
+                    if best_run is None:
+                        best_run = max(runs, key=len)
+                    
+                    good_lo, good_hi = xx[best_run[0]], xx[best_run[-1]]
+                    r_pdp_rec_range.set({'lo': good_lo, 'hi': good_hi, 'var': selected_var})
+                    
+                    ax.axvspan(good_lo, good_hi, color="lightgreen", alpha=0.4,
+                              label=f"권장 구간 {good_lo:.2f} ≤ x ≤ {good_hi:.2f}", zorder=1)
+                else:
+                    r_pdp_rec_range.set(None)
+                
+                ax.axvline(x=current_val, color='red', linestyle='--', linewidth=2.5,
+                          label=f'현재 값: {current_val:.2f}', zorder=10)
+                
+                ax.legend(loc='best', fontsize=10)
+                ax.set_title(f"PDP: {get_kr_name(selected_var)} 변화에 따른 불량 예측 확률",
+                            fontsize=14, pad=15, fontweight='bold')
+                ax.set_xlabel(get_kr_name(selected_var), fontsize=12)
+                ax.set_ylabel('불량 확률 (predict_proba)', fontsize=12)
+                ax.grid(True, alpha=0.3, linestyle='--')
+                plt.tight_layout()
+                return display.figure_
+            except Exception as e:
+                fig, ax = plt.subplots(figsize=(10, 4))
+                ax.text(0.5, 0.5, f"PDP Plot 생성 오류: {str(e)}", 
+                       ha='center', va='center', fontsize=10, color='red')
+                ax.axis('off')
+                print(f"PDP Plot 오류 상세: {e}")
+                return fig
+        
+        @output
+        @render.ui
+        def pdp_recommendation():
+            current_input = r_current_input()
+            prediction_result = r_prediction_result()
+            pdp_range = r_pdp_rec_range()
+            
+            if current_input is None or prediction_result is None:
+                return ui.div()
+            
+            if prediction_result == "success":
+                return ui.div(
+                    ui.div(
+                        ui.h5("✅ 현재 상태: 양품 예측", class_="text-success"),
+                        ui.p("현재 입력된 공정 변수 값으로 양품이 예측됩니다. 현재 설정을 유지하시기 바랍니다.", 
+                            class_="text-muted"),
+                        class_="alert alert-success"
+                    )
+                )
+            
+            try:
+                selected_var = input.pdp_variable_selector()
+                current_value = current_input[selected_var].values[0]
+                
+                if pdp_range and pdp_range['var'] == selected_var:
+                    rec_lo = pdp_range['lo']
+                    rec_hi = pdp_range['hi']
+                    recommendation_text = f"""
+                    **{get_kr_name(selected_var)} 조정 권장사항:**
+                    
+                    - **현재 값:** {current_value:.2f}
+                    - **권장 범위:** **{rec_lo:.2f} ~ {rec_hi:.2f}**
+                    
+                    **개선 방안:**
+                    PDP 그래프 분석 결과, **{get_kr_name(selected_var)}** 값을 위 권장 범위 내로 조정하면 
+                    불량률을 낮출 수 있을 것으로 보입니다.
+                    
+                    **주의:** 실제 공정 변경 시에는 반드시 현장 전문가와 상의하시기 바랍니다.
+                    """
+                else:
+                    recommendation_text = f"""
+                    **{get_kr_name(selected_var)} 조정 권장사항:**
+                    
+                    - **현재 값:** {current_value:.2f}
+                    
+                    **개선 방안:**
+                    PDP 그래프를 참고하여 불량 확률이 낮아지는 구간으로 **{get_kr_name(selected_var)}** 값을 
+                    조정하는 것을 고려해 보세요.
+                    
+                    **주의:** 실제 공정 변경 시에는 반드시 현장 전문가와 상의하시기 바랍니다.
+                    """
+                
+                return ui.div(ui.markdown(recommendation_text), class_="alert alert-info", 
+                            style="margin-top: 15px;")
+            except Exception as e:
+                return ui.div(ui.p(f"권장사항 생성 중 오류 발생: {str(e)}"), class_="alert alert-warning")
+    
+    return server_logic
