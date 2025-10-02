@@ -1,0 +1,246 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from shiny import ui, render
+from common import get_kr_name, EDA_DESCRIPTIONS
+
+def create_eda_ui(data):
+    """데이터 분석(EDA) 탭 UI 생성"""
+    numerical_feats = data['numerical_features']
+    
+    return ui.nav_panel(
+        "데이터 분석 (EDA)",
+        ui.h3("탐색적 데이터 분석(EDA)"),
+        ui.hr(),
+        ui.panel_conditional(
+            "false" if data['data_status']['DATA_PRED_LOADED'] else "true",
+            ui.div(
+                ui.h4("오류: 데이터 파일을 찾을 수 없어 EDA 분석이 불가능합니다."),
+                class_="alert alert-danger"
+            )
+        ),
+        ui.panel_conditional(
+            "true" if data['data_status']['DATA_PRED_LOADED'] else "false",
+            ui.input_select(
+                "eda_variable_selector",
+                "분석할 변수를 선택하세요:",
+                choices={k: get_kr_name(k) for k in numerical_feats},
+                selected="molten_temp"
+            ),
+            ui.div(
+                ui.HTML(
+                    "<b>참고:</b><br>"
+                    "id, name, line, mold_name, emergency_stop, working, upper_mold_temp3, lower_mold_temp3 컬럼은 "
+                    "대부분의 값이 하나로 고정되어 있어 분석에서 제외했습니다.<br>"
+                    "결측치가 1개인 열의 대부분의 결측치가 19327 행에 모여있어, 분석에 방해가 될 것으로 판단해 제거했습니다.<br>"
+                    "tryshot은 D를 뺀 나머지 결측치를 전부 A로 치환했습니다.<br>"
+                    "EMS와 mold_code는 범주형으로 변환했습니다.<br>"
+                    "heating_furnace가 결측이면서 molten_volume이 채워진 행은 C로 치환했습니다."
+                ),
+                style="font-size: 1em; color: #888; margin-top: 5px; line-height: 1.6;"
+            ),
+            ui.hr(),
+            ui.row(
+                ui.column(8,
+                    ui.h4("전처리 전 데이터 분석", style="text-align: center;"),
+                    ui.output_plot("eda_combined_plot_before", height="450px"),
+                    ui.hr(style="margin-top: 2rem; margin-bottom: 2rem;"),
+                    ui.h4("전처리 후 데이터 분석", style="text-align: center;"),
+                    ui.output_plot("eda_combined_plot_after", height="450px")
+                ),
+                ui.column(4,
+                    ui.output_ui("eda_stats_ui")
+                )
+            )
+        ),
+        ui.hr(style="margin-top: 40px; border-top: 2px solid #ccc;"),
+        ui.h3("모델링 요약", style="text-align: center; margin-bottom: 20px;"),
+        ui.div(
+            ui.card(
+                ui.card_header(ui.h5("최종 전처리", style="margin: 0;")),
+                ui.card_body(
+                    ui.p("주요 변수(low_section_speed, molten_temp 등)의 이상치 및 오류 값을 제거하고, "
+                         "KNN Imputer를 사용하여 결측치를 보간했습니다. 이후 수치형 변수는 RobustScaler를, "
+                         "범주형 변수는 Ordinal Encoding을 적용하여 모델 학습에 적합한 형태로 변환했습니다.")
+                )
+            ),
+            ui.card(
+                ui.card_header(ui.h5("최종 선정 모델", style="margin: 0;")),
+                ui.card_body(
+                    ui.p("LightGBM (선정 이유: 다양한 모델 중 불량 케이스를 놓치지 않는 성능(Recall)이 "
+                         "가장 우수하여 선정되었습니다.)")
+                )
+            ),
+            style="display: flex; flex-direction: column; gap: 20px; margin-top: 20px;"
+        ),
+        ui.hr(style="margin-top: 40px; border-top: 2px solid #ccc;"),
+        ui.output_ui("model_performance_table"),
+    )
+
+def create_eda_server(data):
+    """데이터 분석(EDA) 탭 서버 로직"""
+    
+    def server_logic(input, output, session):
+        
+        @output
+        @render.plot(alt="전처리 전 EDA 시각화")
+        def eda_combined_plot_before():
+            if not data['data_status']['DATA_PRED_LOADED']:
+                return
+            
+            selected_var = input.eda_variable_selector()
+            if not selected_var or selected_var not in data['df_raw'].columns:
+                return
+            
+            fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+            fig.suptitle(f"'{get_kr_name(selected_var)}' 변수 분석 (전처리 전)", 
+                        fontsize=16, weight='bold')
+            
+            sns.histplot(data['df_raw'][selected_var], kde=True, ax=axes[0], color='skyblue')
+            axes[0].set_title("전체 데이터 분포", fontsize=12)
+            axes[0].set_xlabel("값")
+            axes[0].set_ylabel("빈도")
+            
+            sns.boxplot(x='passorfail', y=selected_var, data=data['df_raw'], ax=axes[1])
+            axes[1].set_title("불량 여부에 따른 분포 비교", fontsize=12)
+            axes[1].set_xlabel("불량 여부 (0: 양품, 1: 불량)")
+            axes[1].set_ylabel("값")
+            
+            plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+            return fig
+        
+        @output
+        @render.plot(alt="전처리 후 EDA 시각화")
+        def eda_combined_plot_after():
+            if not data['data_status']['DATA_PRED_LOADED']:
+                return
+            
+            selected_var = input.eda_variable_selector()
+            if not selected_var or selected_var not in data['df_pred'].columns:
+                return
+            
+            fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+            fig.suptitle(f"'{get_kr_name(selected_var)}' 변수 분석 (전처리 후)", 
+                        fontsize=16, weight='bold')
+            
+            sns.histplot(data['df_pred'][selected_var], kde=True, ax=axes[0], color='lightgreen')
+            axes[0].set_title("전체 데이터 분포", fontsize=12)
+            axes[0].set_xlabel("값")
+            axes[0].set_ylabel("빈도")
+            
+            sns.boxplot(x='passorfail', y=selected_var, data=data['df_pred'], ax=axes[1])
+            axes[1].set_title("불량 여부에 따른 분포 비교", fontsize=12)
+            axes[1].set_xlabel("불량 여부 (0: 양품, 1: 불량)")
+            axes[1].set_ylabel("값")
+            
+            plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+            return fig
+        
+        @output
+        @render.ui
+        def eda_stats_ui():
+            if not data['data_status']['DATA_PRED_LOADED']:
+                return
+            
+            selected_var = input.eda_variable_selector()
+            if not selected_var:
+                return ui.div("변수를 선택해주세요.", class_="alert alert-warning")
+            
+            # 전처리 전 통계량
+            if selected_var in data['df_raw'].columns:
+                stats_before_df = data['df_raw'].groupby('passorfail')[selected_var].describe().T
+                stats_before_df.columns = ['양품 (0)', '불량 (1)']
+                stats_before_html = stats_before_df.to_html(
+                    classes="table table-sm table-striped", 
+                    float_format='{:,.2f}'.format
+                )
+                ui_before = ui.div(
+                    ui.h5("전처리 전 통계량"),
+                    ui.HTML(stats_before_html)
+                )
+            else:
+                ui_before = ui.div(
+                    ui.h5("전처리 전 통계량"),
+                    ui.p("데이터 없음", class_="text-muted")
+                )
+            
+            # 전처리 후 통계량
+            if selected_var in data['df_pred'].columns:
+                stats_after_df = data['df_pred'].groupby('passorfail')[selected_var].describe().T
+                stats_after_df.columns = ['양품 (0)', '불량 (1)']
+                stats_after_html = stats_after_df.to_html(
+                    classes="table table-sm table-striped", 
+                    float_format='{:,.2f}'.format
+                )
+                ui_after = ui.div(
+                    ui.h5("전처리 후 통계량", class_="mt-4"),
+                    ui.HTML(stats_after_html)
+                )
+            else:
+                ui_after = ui.div(
+                    ui.h5("전처리 후 통계량", class_="mt-4"),
+                    ui.p("데이터 없음", class_="text-muted")
+                )
+            
+            # 변수 처리 요약
+            default_summary = "이 변수에는 일반적인 전처리가 적용되었습니다."
+            summary_text = EDA_DESCRIPTIONS.get(selected_var, default_summary)
+            
+            return ui.card(
+                ui.card_header(f"'{get_kr_name(selected_var)}' 기술 통계량"),
+                ui_before,
+                ui_after,
+                ui.div(
+                    ui.h6("변수 처리 및 분석 요약", class_="mt-4"),
+                    ui.div(ui.HTML(summary_text), style="line-height: 1.6;")
+                )
+            )
+        
+        @output
+        @render.ui
+        def model_performance_table():
+            report_data = {
+                'precision': [1.00, 0.95, None, 0.97, 1.00],
+                'recall': [1.00, 0.96, None, 0.98, 1.00],
+                'f1-score': [1.00, 0.96, 1.00, 0.98, 1.00],
+                'support': [14058, 662, 14720, 14720, 14720]
+            }
+            report_index = ['양품 (Class 0)', '불량 (Class 1)', 'accuracy', 'macro avg', 'weighted avg']
+            df_report = pd.DataFrame(report_data, index=report_index)
+            df_report['support'] = df_report['support'].astype(int)
+            
+            cm_data = [[14021, 37], [26, 636]]
+            df_cm = pd.DataFrame(
+                cm_data,
+                columns=pd.MultiIndex.from_product([['예측 (Predicted)'], ['양품 (0)', '불량 (1)']]),
+                index=pd.MultiIndex.from_product([['실제 (True)'], ['양품 (0)', '불량 (1)']])
+            )
+            
+            cm_html = df_cm.to_html(classes="table table-bordered text-center", justify="center")
+            report_html = df_report.to_html(
+                classes="table table-striped table-hover", 
+                float_format='{:.2f}'.format, 
+                na_rep=""
+            )
+            
+            return ui.div(
+                ui.h3("모델 성능 평가", style="text-align: center; margin-bottom: 20px;"),
+                ui.row(
+                    ui.column(5,
+                        ui.h5("혼동 행렬 (Confusion Matrix)", style="text-align: center;"),
+                        ui.HTML(cm_html),
+                        style="display: flex; flex-direction: column; align-items: center;"
+                    ),
+                    ui.column(7,
+                        ui.h5("분류 리포트 (Classification Report)"),
+                        ui.HTML(report_html),
+                        ui.div(
+                            ui.p("ROC-AUC: 0.9889", 
+                                style="font-weight: bold; margin-top: 10px; display: inline-block; margin-right: 20px;"),
+                            ui.p("(Threshold: 0.8346)", style="display: inline-block;")
+                        )
+                    )
+                )
+            )
+    
+    return server_logic
