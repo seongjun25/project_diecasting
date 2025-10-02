@@ -1,7 +1,7 @@
 # project_diecasting
 
 
-이 Shiny 앱의 README에 포함할 내용을 정리해드리겠습니다.
+
 markdown# 다이캐스팅 공정 품질관리 대시보드
 
 다이캐스팅 공정 데이터를 기반으로 불량을 예측하고 품질을 모니터링하는 Shiny 웹 애플리케이션입니다.
