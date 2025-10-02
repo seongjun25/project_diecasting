@@ -1,0 +1,88 @@
+import pandas as pd
+import numpy as np
+
+from sklearn.impute import KNNImputer, SimpleImputer
+from sklearn.preprocessing import OrdinalEncoder, RobustScaler, StandardScaler
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from lightgbm import LGBMClassifier
+from sklearn.metrics import classification_report, roc_auc_score, confusion_matrix
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# -------------------
+# 0) 데이터 불러오기 & 전처리
+# -------------------
+df = pd.read_csv("./project_no1/train.csv")
+
+# 이상치/결측 행 제거
+df = df.drop(index=19327) 
+df = df.drop(index=[6000,11811,17598]) 
+df = df.drop(index=[46546])
+df = df.drop(index=list(df[df['Coolant_temperature'] == 1449].index))
+df = df.drop(index=list(df[df['upper_mold_temp1'] == 1449].index))
+df = df.drop(index=list(df[df['upper_mold_temp2'] == 4232].index))
+
+# 시간 변수 가공
+df['registration_time'] = pd.to_datetime(df['registration_time'])
+df['hour'] = df['registration_time'].dt.hour.astype(object)
+
+# 결측치 보정
+df['tryshot_signal'] = df['tryshot_signal'].fillna('A')
+df['molten_volume'] = df['molten_volume'].fillna(0)
+condition = (df['molten_volume'].notna()) & (df['heating_furnace'].isna())
+df.loc[condition, 'heating_furnace'] = 'C'
+
+# 타입 변경
+df["mold_code"] = df["mold_code"].astype(object)
+df["EMS_operation_time"] = df["EMS_operation_time"].astype(object)
+
+# 값 조건 기반 결측 처리
+df.loc[df["molten_temp"] <= 80, "molten_temp"] = np.nan
+df.loc[df["physical_strength"] <= 5, "physical_strength"] = np.nan
+
+# 불필요한 컬럼 제거
+df = df.drop(columns=[
+    'id','line','name','mold_name','emergency_stop','time','date','registration_time',
+    'upper_mold_temp3','lower_mold_temp3','working'
+])
+df.info()
+# -------------------
+# 1) X, y 분리
+# -------------------
+y = df['passorfail']
+X = df.drop(columns=['passorfail'])
+
+# 시간 순서 기준으로 split 
+split_point = int(len(df) * 0.8)
+X_train, X_test = X.iloc[:split_point], X.iloc[split_point:]
+y_train, y_test = y.iloc[:split_point], y.iloc[split_point:]
+
+import os
+print(os.getcwd())
+os.chdir("..")
+os.chdir("project_no1")
+
+
+
+
+
+import joblib
+from sklearn.inspection import PartialDependenceDisplay
+import matplotlib.pyplot as plt
+
+final_model = joblib.load("./project_no1/final_model.pkl")
+feature_names = final_model['feature_names']
+
+# 실제 모델 객체 추출 (일반적으로 'model' 또는 'estimator' 키에 저장됨)
+model = final_model['model']  # 또는 final_model['estimator']
+
+X_sample = X_train.sample(3000, random_state=42)  
+PartialDependenceDisplay.from_estimator(
+    model,  # 딕셔너리가 아닌 실제 모델 객체 사용
+    X_sample,
+    features=["upper_mold_temp2"],
+    feature_names=feature_names,
+    grid_resolution=20
+)
+plt.show()
