@@ -1,0 +1,459 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import plotly.graph_objects as go
+from shiny import ui, render, reactive
+from common import get_kr_name, calculate_cpk, HOURLY_CHOICES
+
+def create_monitoring_ui(data):
+    """성과 모니터링 탭 UI 생성"""
+    min_date = data['min_date_str'] if data['min_date_str'] else "2024-01-01"
+    max_date = data['max_date_str'] if data['max_date_str'] else "2024-12-31"
+    cpk_analysis_vars = data['numerical_features']
+    
+    return ui.nav_panel(
+        "성과 모니터링",
+        ui.div(
+            ui.div(
+                ui.h5("Line: 전자교반 3라인 2호기", style="margin: 0; color: #555;"),
+                ui.h5("Name: TM Carrier RH", style="margin: 5px 0 0 0; color: #555;"),
+                style="padding: 10px; background-color: #f0f0f0; border-radius: 5px; margin-bottom: 15px;"
+            ),
+            ui.h3("불량률 현황"),
+            ui.row(
+                ui.column(3, ui.div(
+                    ui.input_date("date_selector", "날짜 선택", 
+                                  value=max_date,
+                                  min=min_date,
+                                  max=max_date),
+                    style="margin-bottom: 15px;")),
+                ui.column(9)
+            ),
+            ui.row(
+                ui.column(3, ui.output_ui("overall_failure_rate_card_4col")),
+                ui.column(3, ui.output_ui("daily_change_card")),
+                ui.column(3, ui.output_ui("daily_failure_rate_card_4col")),
+                ui.column(3, ui.output_ui("target_failure_rate_card")),
+            ),
+            style="padding: 15px; border: 1px solid #ddd; border-radius: 5px; margin-bottom: 20px;"
+        ),
+        ui.hr(),
+        ui.panel_conditional("false" if data['data_status']['DATA_PRED_LOADED'] else "true", 
+            ui.div(
+                ui.h4("오류: 데이터 파일을 찾을 수 없습니다."),
+                class_="alert alert-danger"
+            )
+        ),
+        ui.panel_conditional("false" if data['data_status']['MODEL_LOADED'] else "true", 
+            ui.div(
+                ui.h4("경고: 모델 파일을 찾을 수 없습니다."),
+                ui.p("예측 기능을 사용할 수 없습니다."),
+                class_="alert alert-warning"
+            )
+        ),
+        ui.div(
+            ui.h4("품질 추이 및 모델 성능 분석 (시계열)"),
+            ui.p("선택한 날짜와 공정 변수에 대한 시간(Time)별 데이터를 시계열 그래프로 확인합니다."),
+            ui.input_select("cpk_variable_selector", "분석할 변수를 선택하세요:", 
+                          choices={k: get_kr_name(k) for k in cpk_analysis_vars} if cpk_analysis_vars else {"none": "데이터 없음"}),
+            ui.output_ui("cpk_values_ui"),
+            ui.output_plot("cpk_plot", height="300px"),
+            ui.hr(),
+            ui.row(
+                ui.column(6, ui.input_date_range(
+                        "date_range_hourly", 
+                        "분석 기간 선택",
+                        start=min_date, 
+                        end=max_date, 
+                        min=min_date,
+                        max=max_date
+                    )
+                ),
+                ui.column(6, ui.input_select("variable_selector_hourly", "분석할 변수 선택", 
+                                           choices={k: get_kr_name(k) for k in HOURLY_CHOICES})),
+            ),
+            ui.output_ui("hourly_timeseries_plot", style="height:400px;"),
+            style="padding: 15px;"
+        )
+    )
+
+def create_monitoring_server(data):
+    """성과 모니터링 탭 서버 로직"""
+    
+    def server_logic(input, output, session):
+        # 카드 렌더링 함수들
+        @output
+        @render.ui
+        def overall_failure_rate_card_4col():
+            if not data['data_status']['DATA_PRED_LOADED']:
+                return ui.div("데이터 없음", class_="alert alert-secondary text-center p-3")
+            
+            overall_rate = data['overall_failure_rate']
+            total_cnt = data['total_count']
+            total_fail = data['total_failures']
+            
+            card_color = "bg-danger" if overall_rate > 5 else "bg-primary"
+            return ui.div(
+                ui.h5("전체 기간 불량률"),
+                ui.h2(f"{overall_rate:.2f}%"),
+                ui.p(f"(총 {int(total_cnt):,}개 중 {int(total_fail):,}개 불량)"),
+                class_=f"card text-white {card_color} text-center p-3",
+                style="border-radius: 5px; height: 100%; display: flex; flex-direction: column; justify-content: center;"
+            )
+        
+        @output
+        @render.ui
+        def daily_failure_rate_card_4col():
+            if not data['data_status']['DATA_PRED_LOADED']:
+                return ui.div("데이터 없음", class_="alert alert-warning")
+            
+            selected_date_str = input.date_selector()
+            if not selected_date_str:
+                return ui.div("날짜를 선택해주세요.", class_="alert alert-info text-center p-3")
+            
+            try:
+                selected_date = pd.to_datetime(selected_date_str).date()
+                rate, total, failures = data['daily_stats'].loc[selected_date, ['failure_rate', 'total', 'failures']]
+                card_color = "bg-danger" if rate > 5 else "bg-success"
+                return ui.div(
+                    ui.h5("선택일 불량률"),
+                    ui.h2(f"{rate:.2f}%"),
+                    ui.p(f"(총 {int(total):,}개 중 {int(failures):,}개 불량)"),
+                    class_=f"card text-white {card_color} text-center p-3",
+                    style="border-radius: 5px; height: 100%;"
+                )
+            except Exception:
+                return ui.div(f"{selected_date_str} 데이터 없음", class_="alert alert-warning text-center p-3")
+        
+        @output
+        @render.ui
+        def daily_change_card():
+            if not data['data_status']['DATA_PRED_LOADED']:
+                return ui.div("데이터 없음", class_="alert alert-secondary text-center p-3")
+            
+            selected_date_str = input.date_selector()
+            try:
+                current_date = pd.to_datetime(selected_date_str)
+                date_index = data['daily_stats'].index.get_loc(current_date.date())
+                if date_index == 0:
+                    return ui.div("전일 데이터 없음", class_="alert alert-secondary text-center p-3")
+                
+                prev_date = data['daily_stats'].index[date_index - 1]
+                current_rate = data['daily_stats'].loc[current_date.date(), 'failure_rate']
+                prev_rate = data['daily_stats'].loc[prev_date, 'failure_rate']
+                change = current_rate - prev_rate
+                
+                if change < 0:
+                    change_text, card_class, icon = f"{change:+.2f}%p", "bg-info", "bi-arrow-down-right"
+                elif change > 0:
+                    change_text, card_class, icon = f"{change:+.2f}%p", "bg-danger", "bi-arrow-up-right"
+                else:
+                    change_text, card_class, icon = "변화 없음", "bg-secondary", "bi-dash"
+                
+                return ui.div(
+                    ui.h5("전일 대비 증감"),
+                    ui.h2(ui.span(class_=f"bi {icon}"), f" {change_text}"),
+                    ui.p(f"({prev_date.strftime('%Y-%m-%d')} {prev_rate:.2f}% → {current_rate:.2f}%)"),
+                    class_=f"card text-white {card_class} text-center p-3",
+                    style="border-radius: 5px; height: 100%;"
+                )
+            except Exception:
+                return ui.div("전일 데이터 없음", class_="alert alert-secondary text-center p-3")
+        
+        @output
+        @render.ui
+        def target_failure_rate_card():
+            if not data['data_status']['DATA_PRED_LOADED']:
+                return ui.div("데이터 없음", class_="alert alert-secondary text-center p-3")
+            
+            selected_date_str = input.date_selector()
+            if not selected_date_str:
+                return ui.div("날짜를 선택해주세요.", class_="alert alert-info text-center p-3")
+            
+            try:
+                selected_date = pd.to_datetime(selected_date_str).date()
+                df = data['df_raw'].copy()
+                
+                if "datetime_full" not in df.columns:
+                    return ui.div("시간 데이터 없음", class_="alert alert-warning text-center p-3")
+                
+                df_day = df[df["datetime_full"].dt.date == selected_date]
+                if df_day.empty:
+                    return ui.div(f"{selected_date} 데이터 없음", class_="alert alert-info text-center p-3")
+                
+                df_day["hour"] = df_day["datetime_full"].dt.hour
+                failure_by_hour = df_day.groupby("hour")["passorfail"].mean() * 100
+                
+                if failure_by_hour.empty:
+                    return ui.div(f"{selected_date} 불량 데이터 없음", class_="alert alert-info text-center p-3")
+                
+                top_hours = failure_by_hour.sort_values(ascending=False).head(2)
+                content = [ui.h3(f"{hour}시 → {rate:.2f}%") for hour, rate in top_hours.items()]
+                
+                return ui.div(
+                    ui.h5("불량 집중 시간대", style="margin-bottom: 10px;"),
+                    ui.div(*content, style="text-align: center; margin: 10px 0;"),
+                    ui.p(f"(선택일: {selected_date})", style="margin-top: 5px;"),
+                    class_="card bg-warning text-dark text-center p-3",
+                    style="border-radius: 5px; height: 100%;"
+                )
+            except Exception as e:
+                return ui.div(f"에러: {e}", class_="alert alert-danger text-center p-3")
+        
+        # Cpk 분석
+        @reactive.Calc
+        def daily_filtered_data_and_cpk():
+            selected_date_str = input.date_selector()
+            selected_var = input.cpk_variable_selector()
+            
+            if not selected_date_str or not selected_var or selected_var == "none":
+                return {'data': pd.Series(dtype='float64'), 'stats': {}}
+            
+            try:
+                selected_date = pd.to_datetime(selected_date_str).date()
+                
+                if 'date_only' not in data['df_ts'].columns:
+                    return {'data': pd.Series(dtype='float64'), 'stats': {}}
+                
+                filtered_df = data['df_ts'][data['df_ts']['date_only'] == selected_date]
+                
+                if filtered_df.empty:
+                    return {'data': pd.Series(dtype='float64'), 'stats': {}}
+                
+                series = filtered_df[selected_var].dropna()
+                limits = data['spec_limits'].get(selected_var, {})
+                
+                if not limits or series.empty:
+                    return {'data': series, 'stats': {}}
+                
+                results = calculate_cpk(series, limits['lsl'], limits['usl'])
+                results.update({'lsl': limits['lsl'], 'usl': limits['usl'], 'estimated': limits['estimated']})
+                
+                return {'data': series, 'stats': results}
+            
+            except Exception as e:
+                print(f"Cpk 계산 중 오류 발생: {e}")
+                return {'data': pd.Series(dtype='float64'), 'stats': {}}
+        
+        @output
+        @render.ui
+        def cpk_values_ui():
+            if not data['data_status']['DATA_PRED_LOADED']:
+                return ui.div("데이터가 없어 분석할 수 없습니다.", class_="alert alert-warning")
+            
+            analysis_results = daily_filtered_data_and_cpk()
+            results = analysis_results['stats']
+            
+            if not results:
+                return ui.p("선택한 날짜에 대한 분석 데이터가 없습니다.")
+            
+            cp, cpk, ucl, lcl = results.get('cp'), results.get('cpk'), results.get('ucl'), results.get('lcl')
+            
+            if isinstance(cpk, (int, float)):
+                if cpk >= 1.33:
+                    interpretation, cls = "매우 양호", "text-success"
+                elif cpk >= 1.0:
+                    interpretation, cls = "양호", "text-primary"
+                elif cpk >= 0.67:
+                    interpretation, cls = "주의 필요", "text-warning"
+                else:
+                    interpretation, cls = "개선 시급", "text-danger"
+            else:
+                interpretation, cls = "판단 불가", "text-muted"
+            
+            ucl_tooltip = "UCL (Upper Control Limit)\n상한 관리 한계선\n\n공정이 정상적으로 작동할 때 예상되는 최대값\n이 선을 초과하면 공정에 이상이 있다고 판단\n일반적으로 평균 + 3σ(표준편차)로 설정"
+            lcl_tooltip = "LCL (Lower Control Limit)\n하한 관리 한계선\n\n공정이 정상적으로 작동할 때 예상되는 최소값\n이 선 아래로 떨어지면 공정에 이상이 있다고 판단\n일반적으로 평균 - 3σ(표준편차)로 설정"
+            cp_tooltip = "Cp (Process Capability Index)\n공정 능력 지수\n\n규격 범위 대비 공정 산포의 비율\n계산식: (USL - LSL) / 6σ"
+            cpk_tooltip = "Cpk (Process Capability Index with centering)\n공정 능력 지수 (중심 보정)\n\n규격 중심으로부터 공정 평균의 치우침을 고려한 지수"
+            
+            def create_info_box(title, value, tooltip_text, alert_class):
+                return ui.column(3,
+                    ui.div(
+                        ui.h5(title, ui.tags.span("ⓘ", class_="tooltip-icon", **{"data-tooltip": tooltip_text})),
+                        ui.p(f"{value}"),
+                        class_=f"text-center alert {alert_class} p-2"
+                    )
+                )
+            
+            return ui.div(
+                ui.row(
+                    create_info_box("UCL", ucl, ucl_tooltip, "alert-secondary"),
+                    create_info_box("LCL", lcl, lcl_tooltip, "alert-secondary"),
+                    create_info_box("Cp", cp, cp_tooltip, "alert-info"),
+                    create_info_box("Cpk", cpk, cpk_tooltip, "alert-info"),
+                ),
+                ui.div(ui.h5("공정 능력 평가", class_="mt-3"), ui.p(interpretation, class_=f"fw-bold {cls}"))
+            )
+        
+        @output
+        @render.plot
+        def cpk_plot():
+            if not data['data_status']['DATA_PRED_LOADED']:
+                return
+            
+            analysis_results = daily_filtered_data_and_cpk()
+            plot_data = analysis_results['data']
+            stats = analysis_results['stats']
+            selected_var = input.cpk_variable_selector()
+            selected_date = input.date_selector()
+            
+            if plot_data.empty or not stats:
+                fig, ax = plt.subplots(figsize=(8, 3))
+                ax.text(0.5, 0.5, f"{selected_date}에 대한 데이터가 없습니다.", 
+                       ha='center', va='center', fontsize=12, color='gray')
+                ax.set_title(f'{get_kr_name(selected_var)} 공정 능력 분석', fontsize=12)
+                ax.axis('off')
+                return fig
+            
+            mean, ucl, lcl = stats.get('mean'), stats.get('ucl'), stats.get('lcl')
+            fig, ax = plt.subplots(figsize=(8, 3))
+            ax.hist(plot_data, bins=30, density=True, color='skyblue', alpha=0.7, label='데이터 분포')
+            
+            if mean is not None:
+                ax.axvline(mean, color='red', linestyle='--', linewidth=2, label=f'평균: {mean}')
+            if lcl is not None:
+                ax.axvline(lcl, color='gold', linestyle='-', linewidth=2, label=f'LCL: {lcl}')
+            if ucl is not None:
+                ax.axvline(ucl, color='gold', linestyle='-', linewidth=2, label=f'UCL: {ucl}')
+            
+            ax.set_title(f'[{selected_date}] {get_kr_name(selected_var)} 공정 능력 분석', fontsize=12)
+            ax.set_xlabel('값', fontsize=10)
+            ax.set_ylabel('밀도', fontsize=10)
+            ax.legend()
+            ax.grid(True, linestyle=':', alpha=0.6)
+            fig.tight_layout()
+            return fig
+        
+        @output
+        @render.ui
+        def hourly_timeseries_plot():
+            if not data['data_status']['DATA_PRED_LOADED']:
+                return ui.HTML("<div>⚠️ 데이터가 로드되지 않았습니다.</div>")
+            
+            date_range = input.date_range_hourly()
+            KEY_FEATURE = input.variable_selector_hourly()
+            TIME_COL_PROCESSED = 'datetime_full'
+            
+            if not date_range or not KEY_FEATURE:
+                return ui.HTML("<div>날짜와 변수를 선택해주세요.</div>")
+            
+            if TIME_COL_PROCESSED not in data['df_ts'].columns:
+                return ui.HTML("<div>⚠️ 시간 데이터 없음</div>")
+            
+            try:
+                start_date_str = date_range[0]
+                end_date_str = date_range[1]
+                
+                start_dt = pd.to_datetime(start_date_str).normalize()
+                end_dt = pd.to_datetime(end_date_str).normalize() + pd.Timedelta(days=1)
+                
+                if start_dt >= end_dt:
+                    return ui.HTML("<div>⚠️ 시작 날짜는 끝 날짜보다 이전이어야 합니다.</div>")
+                
+                plot_data = data['df_ts'][
+                    (data['df_ts'][TIME_COL_PROCESSED] >= start_dt) & 
+                    (data['df_ts'][TIME_COL_PROCESSED] < end_dt)
+                ].copy()
+                
+                KEY_FEATURE_KR = get_kr_name(KEY_FEATURE)
+                
+                if plot_data.empty or plot_data[KEY_FEATURE].isnull().all():
+                    title_text = f"기간: {start_date_str} ~ {end_date_str} ({KEY_FEATURE_KR})"
+                    fig = go.Figure()
+                    fig.update_layout(
+                        title=title_text,
+                        xaxis_title="날짜",
+                        yaxis_title=f"{KEY_FEATURE_KR} 값",
+                        annotations=[{
+                            "text": "⚠️ 선택된 기간에 데이터가 없습니다.",
+                            "xref": "paper", "yref": "paper",
+                            "x": 0.5, "y": 0.5,
+                            "showarrow": False,
+                            "font": {"size": 16, "color": "gray"}
+                        }]
+                    )
+                else:
+                    WINDOW_SIZE = 3
+                    SMOOTHED_FEATURE = f'{KEY_FEATURE}_smoothed'
+                    
+                    plot_data = plot_data.set_index(TIME_COL_PROCESSED)
+                    plot_data[SMOOTHED_FEATURE] = (
+                        plot_data[KEY_FEATURE]
+                        .rolling(window=WINDOW_SIZE, center=True, min_periods=1)
+                        .mean()
+                    )
+                    plot_data = plot_data.reset_index()
+                    
+                    min_time = plot_data[TIME_COL_PROCESSED].min()
+                    max_time = plot_data[TIME_COL_PROCESSED].max()
+                    y_min = plot_data[KEY_FEATURE].min()
+                    y_max = plot_data[KEY_FEATURE].max()
+                    y_padding = (y_max - y_min) * 0.1
+                    
+                    fail_data = plot_data[
+                        (plot_data['passorfail'] == 1) & 
+                        (plot_data[KEY_FEATURE].notna())
+                    ].copy()
+                    
+                    title_text = f"기간: {start_date_str} ~ {end_date_str} ({KEY_FEATURE_KR}) 시계열 추이"
+                    
+                    fig = go.Figure()
+                    
+                    fig.add_trace(go.Scatter(
+                        x=plot_data[TIME_COL_PROCESSED],
+                        y=plot_data[SMOOTHED_FEATURE],
+                        name=KEY_FEATURE_KR,
+                        mode="lines",
+                        line={"width": 2, "smoothing": 0.8, "color": "blue"}
+                    ))
+                    
+                    if not fail_data.empty:
+                        fig.add_trace(go.Scatter(
+                            x=fail_data[TIME_COL_PROCESSED],
+                            y=fail_data[KEY_FEATURE],
+                            name="불량 발생 (Fail)",
+                            mode="markers",
+                            marker=dict(symbol='circle', size=5, color='red'),
+                            hoverinfo='name+x+y'
+                        ))
+                    
+                    fig.update_layout(
+                        title=title_text,
+                        height=600,
+                        hovermode="x unified",
+                        template="plotly_white",
+                        xaxis=dict(
+                            type="date",
+                            title="날짜/시간",
+                            rangeselector=dict(
+                                buttons=list([
+                                    dict(count=1, label="1개월", step="month", stepmode="backward"),
+                                    dict(count=3, label="3개월", step="month", stepmode="backward"),
+                                    dict(count=6, label="6개월", step="month", stepmode="backward"),
+                                    dict(step="all", label="전체 기간")
+                                ])
+                            ),
+                            rangeslider=dict(
+                                visible=True,
+                                range=[min_time, max_time],
+                                yaxis=dict(range=[y_min - y_padding, y_max + y_padding])
+                            )
+                        ),
+                        yaxis=dict(
+                            title=f"{KEY_FEATURE_KR} 값",
+                            autorange=True,
+                            rangemode='tozero',
+                        )
+                    )
+                
+                html_out = fig.to_html(full_html=False, include_plotlyjs='cdn')
+                return ui.HTML(html_out)
+                
+            except Exception as e:
+                import traceback
+                error_message = f"그래프 생성 중 오류 발생: {e}"
+                print(f"❌ Plotly 그래프 생성 오류: {e}")
+                traceback.print_exc()
+                return ui.HTML(f"<div>{error_message}</div>")
+    
+    return server_logic
