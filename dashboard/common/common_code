@@ -1,0 +1,290 @@
+import pandas as pd
+import joblib
+from pathlib import Path
+import matplotlib.pyplot as plt
+import warnings
+
+# Matplotlib 한글 폰트 설정
+plt.rcParams['font.family'] = 'Malgun Gothic'
+plt.rcParams['axes.unicode_minus'] = False
+
+# --- 파일 경로 설정 ---
+APP_DIR = Path(__file__).parent
+DATA_RAW_FILE_NAME = "train.csv"
+DATA_TS_FILE_NAME = "train_drop.csv"
+DATA_PRED_FILE_NAME = "train_df.csv"
+MODEL_FILE_NAME = "final_model.pkl"
+
+DATA_RAW_FILE_PATH = APP_DIR / DATA_RAW_FILE_NAME
+DATA_TS_FILE_PATH = APP_DIR / DATA_TS_FILE_NAME
+DATA_PRED_FILE_PATH = APP_DIR / DATA_PRED_FILE_NAME
+MODEL_FILE_PATH = APP_DIR / MODEL_FILE_NAME
+
+# --- 변수명 한글 매핑 딕셔너리 ---
+FEATURE_NAME_KR = {
+    "cast_pressure": "주조압력(cast_pressure)",
+    "count": "카운트(count)",
+    "upper_mold_temp1": "상부금형온도1(upper_mold_temp1)",
+    "lower_mold_temp2": "하부금형온도2(lower_mold_temp2)",
+    "low_section_speed": "저속구간속도(low_section_speed)",
+    "lower_mold_temp1": "하부금형온도1(lower_mold_temp1)",
+    "sleeve_temperature": "슬리브온도(sleeve_temperature)",
+    "high_section_speed": "고속구간속도(high_section_speed)",
+    "upper_mold_temp2": "상부금형온도2(upper_mold_temp2)",
+    "biscuit_thickness": "비스킷두께(biscuit_thickness)",
+    "facility_operation_cycleTime": "설비작동사이클시간(facility_operation_cycleTime)",
+    "Coolant_temperature": "냉각수온도(Coolant_temperature)",
+    "production_cycletime": "생산사이클시간(production_cycletime)",
+    "molten_temp": "용탕온도(molten_temp)",
+    "molten_volume": "용탕량(molten_volume)",
+    "physical_strength": "물리적강도(physical_strength)",
+    "EMS_operation_time": "EMS작동시간(EMS_operation_time)",
+    "hour": "시간(hour)",
+    "heating_furnace": "가열로(heating_furnace)",
+    "tryshot_signal": "트라이샷신호(tryshot_signal)",
+    "mold_code": "금형코드(mold_code)",
+    "working": "가동여부(working)"
+}
+
+def get_kr_name(eng_name):
+    """영어 변수명을 한글(영어) 형식으로 반환"""
+    return FEATURE_NAME_KR.get(eng_name, eng_name)
+
+EDA_DESCRIPTIONS = {
+    "low_section_speed": """값 65535는 이상치로 판단되어 해당 데이터 행을 제거했습니다.<br>
+                            49 이하이면서 양품인 데이터 26개 중 6개를 KNN을 통해 불량으로 치환했습니다.<br>
+                            이후 남은 결측치는 KNN Imputer를 통해 주변 값으로 보간되었습니다.""",
+    "molten_temp": """용탕 온도가 80도 이하인 데이터는 센서 오류로 간주하여 결측치(NaN)로 처리했습니다.<br>
+                      이후 결측치는 KNN Imputer를 통해 보간되었습니다.""",
+    "physical_strength": """값 65535인 데이터는 이상치로 판단되어 해당 행을 제거했습니다.<br>
+                            강도가 5 이하인 값은 결측치(NAN)로 처리했습니다.<br>
+                            이후 결측치는 KNN Imputer를 통해 보간되었습니다.""",
+    "Coolant_temperature": "냉각수 온도가 1449인 데이터는 이상치로 판단되어 해당 데이터 행들을 제거했습니다. (총 9개 행)",
+    "upper_mold_temp1": "상부 금형 온도가 1449인 데이터는 이상치로 판단되어 해당 데이터 행을 제거했습니다 (1개 행).",
+    "upper_mold_temp2": "상부 금형 온도가 4232인 데이터는 이상치로 판단되어 해당 데이터 행을 제거했습니다 (1개 행).",
+    "tryshot_signal": "결측치가 존재하는 경우, 가장 일반적인 상태인 'A'로 대체했습니다.",
+    "molten_volume": "용탕량이 기록되지 않은 경우(NaN), 값을 0으로 채웠습니다.",
+    "heating_furnace": "용탕량이 기록되었으나 가열로 정보가 없는 경우, 'C' 가열로에서 작업한 것으로 간주하여 결측치를 채웠습니다.",
+    'hour': "registration time에서 시간을 차용하여 범주형으로 처리했습니다.",
+    'EMS_operation_time': "값이 5개(0, 3, 6, 23, 25) 뿐이라 범주형으로 처리했습니다.",
+    'mold_code': '수치의 의미보다 각 코드를 구분하는 의미라고 판단해 범주형으로 처리했습니다.'
+}
+
+EXISTING_NUMERICAL_FEATURES = [
+    "cast_pressure", "count", "upper_mold_temp1", "lower_mold_temp2",
+    "low_section_speed", "lower_mold_temp1", "sleeve_temperature", "high_section_speed",
+    "upper_mold_temp2", "biscuit_thickness", "facility_operation_cycleTime",
+    "Coolant_temperature", "production_cycletime", "molten_temp", "molten_volume",
+    "physical_strength", "EMS_operation_time"
+]
+
+HOURLY_CHOICES = [
+    "cast_pressure", "upper_mold_temp1", "lower_mold_temp2",
+    "low_section_speed", "lower_mold_temp1", "sleeve_temperature", "high_section_speed",
+    "upper_mold_temp2", "biscuit_thickness", "Coolant_temperature", "molten_temp", 
+    "molten_volume", "physical_strength", "EMS_operation_time"
+]
+
+def load_data():
+    """데이터 로드 및 초기화"""
+    data_status = {
+        'DATA_PRED_LOADED': False,
+        'MODEL_LOADED': False
+    }
+    
+    # 초기값 설정
+    df_raw = pd.DataFrame()
+    df_ts = pd.DataFrame()
+    df_pred = pd.DataFrame()
+    pipeline = None
+    feature_names = []
+    feature_stats = {}
+    numerical_features = []
+    mold_code_choices = ["N/A"]
+    mold_code_choices_top5 = ["8722"]
+    working_choices = ["N/A"]
+    spec_limits = {}
+    min_date_str = None
+    max_date_str = None
+    overall_failure_rate = 0
+    total_count = 0
+    total_failures = 0
+    daily_stats = pd.DataFrame()
+    
+    try:
+        # 데이터 로드
+        try:
+            df_raw = pd.read_csv(DATA_RAW_FILE_PATH, low_memory=False)
+        except UnicodeDecodeError:
+            df_raw = pd.read_csv(DATA_RAW_FILE_PATH, encoding='cp949', low_memory=False)
+            
+        try:
+            df_ts = pd.read_csv(DATA_TS_FILE_PATH, low_memory=False)
+        except UnicodeDecodeError:
+            df_ts = pd.read_csv(DATA_TS_FILE_PATH, encoding='cp949', low_memory=False)
+            
+        try:
+            df_pred = pd.read_csv(DATA_PRED_FILE_PATH, low_memory=False)
+        except UnicodeDecodeError:
+            df_pred = pd.read_csv(DATA_PRED_FILE_PATH, encoding='cp949', low_memory=False)
+        
+        # 날짜 처리
+        date_column_name = None
+        if "registration_time" in df_raw.columns:
+            date_column_name = "registration_time"
+        elif "date" in df_raw.columns:
+            date_column_name = "date"
+        elif "time" in df_raw.columns:
+            date_column_name = "time"
+        
+        if date_column_name:
+            df_raw['datetime_full'] = pd.to_datetime(df_raw[date_column_name], errors='coerce')
+            df_raw['date_only'] = df_raw['datetime_full'].dt.date
+        else:
+            df_raw['date_only'] = pd.NaT
+            df_raw['datetime_full'] = pd.NaT
+        
+        # 불량률 계산
+        total_failures = df_pred['passorfail'].sum()
+        total_count = len(df_pred)
+        overall_failure_rate = (total_failures / total_count * 100).round(2) if total_count > 0 else 0
+        
+        # df_pred에 날짜 정보 추가
+        if date_column_name and date_column_name in df_pred.columns:
+            df_raw[date_column_name] = pd.to_datetime(df_raw[date_column_name], errors='coerce')
+            df_pred[date_column_name] = pd.to_datetime(df_pred[date_column_name], errors='coerce')
+            df_pred = pd.merge(df_pred, df_raw[[date_column_name, 'date_only']].drop_duplicates(),
+                             on=date_column_name, how='left')
+        
+        # 일별 통계
+        daily_stats = df_raw.groupby('date_only')['passorfail'].agg(
+            ['count', lambda x: (x == 1.0).sum()]
+        ).rename(columns={'count': 'total', '<lambda_0>': 'failures'})
+        daily_stats = daily_stats[pd.notna(daily_stats.index)]
+        daily_stats['failure_rate'] = (daily_stats['failures'] / daily_stats['total'] * 100).round(2)
+        
+        if len(daily_stats) > 0:
+            min_date_str = daily_stats.index.min().strftime('%Y-%m-%d')
+            max_date_str = daily_stats.index.max().strftime('%Y-%m-%d')
+        else:
+            min_date_str = "2024-01-01"
+            max_date_str = "2024-12-31"
+        
+        # df_ts 날짜 처리
+        if date_column_name and date_column_name in df_ts.columns:
+            df_ts['datetime_full'] = pd.to_datetime(df_ts[date_column_name], errors='coerce')
+            df_ts.dropna(subset=['datetime_full'], inplace=True)
+            df_ts['date_only'] = df_ts['datetime_full'].dt.date
+        
+        # 수치형 변수 및 통계
+        numerical_features = [col for col in EXISTING_NUMERICAL_FEATURES if col in df_pred.columns]
+        
+        for col in numerical_features:
+            clean_series = df_pred[col].dropna()
+            if not clean_series.empty:
+                feature_stats[col] = {
+                    'min': round(float(clean_series.min()), 2),
+                    'max': round(float(clean_series.max()), 2),
+                    'value': round(float(clean_series.median()), 2)
+                }
+            else:
+                feature_stats[col] = {'min': 0, 'max': 100, 'value': 50}
+        
+        # hour 변수 처리
+        HOUR_COL = 'hour'
+        if HOUR_COL in df_raw.columns:
+            clean_series = df_raw[HOUR_COL].dropna()
+            if not clean_series.empty:
+                hour_min, hour_max = clean_series.min(), clean_series.max()
+                feature_stats[HOUR_COL] = {
+                    'min': round(float(hour_min), 2),
+                    'max': round(float(hour_max), 2),
+                    'value': round(float(clean_series.median()), 2)
+                }
+            else:
+                feature_stats[HOUR_COL] = {'min': 0, 'max': 23, 'value': 12}
+        else:
+            feature_stats[HOUR_COL] = {'min': 0, 'max': 23, 'value': 12}
+        
+        if HOUR_COL not in numerical_features:
+            numerical_features.append(HOUR_COL)
+        
+        # mold_code 및 working 선택지
+        if 'mold_code' in df_pred.columns:
+            mold_code_choices = sorted(df_pred['mold_code'].dropna().astype(str).unique().tolist())
+            top5_mold_codes = df_pred['mold_code'].value_counts().head(5).index.astype(str).tolist()
+            mold_code_choices_top5 = top5_mold_codes if top5_mold_codes else ["8722"]
+        
+        working_choices = ['가동', '정지']
+        
+        # Cpk 분석을 위한 spec_limits
+        cpk_analysis_vars = numerical_features
+        for var in cpk_analysis_vars:
+            if var in df_pred.columns:
+                series = df_pred[var].dropna()
+                if len(series) > 1:
+                    mean, std = series.mean(), series.std()
+                    lsl = round(mean - 3 * std, 2)
+                    usl = round(mean + 3 * std, 2)
+                    spec_limits[var] = {'lsl': lsl, 'usl': usl, 'estimated': True}
+        
+        data_status['DATA_PRED_LOADED'] = True
+        
+    except FileNotFoundError as e:
+        print(f"데이터 파일 로드 중 오류: {e}")
+    
+    # 모델 로드
+    try:
+        final_model = joblib.load(MODEL_FILE_PATH)
+        if isinstance(final_model, dict):
+            pipeline = final_model.get("model")
+            feature_names = final_model.get("feature_names", [])
+        else:
+            pipeline = final_model
+        
+        if pipeline is not None and hasattr(pipeline, 'predict'):
+            data_status['MODEL_LOADED'] = True
+    except Exception as e:
+        print(f"모델 로드 중 오류: {e}")
+    
+    return {
+        'df_raw': df_raw,
+        'df_ts': df_ts,
+        'df_pred': df_pred,
+        'pipeline': pipeline,
+        'feature_names': feature_names,
+        'feature_stats': feature_stats,
+        'numerical_features': numerical_features,
+        'mold_code_choices': mold_code_choices,
+        'mold_code_choices_top5': mold_code_choices_top5,
+        'working_choices': working_choices,
+        'spec_limits': spec_limits,
+        'min_date_str': min_date_str,
+        'max_date_str': max_date_str,
+        'overall_failure_rate': overall_failure_rate,
+        'total_count': total_count,
+        'total_failures': total_failures,
+        'daily_stats': daily_stats,
+        'data_status': data_status
+    }
+
+def calculate_cpk(series, lsl, usl):
+    """Cpk 계산"""
+    series = series.dropna()
+    if len(series) < 2:
+        return {}
+    mu, sigma = series.mean(), series.std()
+    if sigma == 0:
+        return {}
+    cp = (usl - lsl) / (6 * sigma)
+    cpk = min((usl - mu) / (3 * sigma), (mu - lsl) / (3 * sigma))
+    ucl = round(mu + 3 * sigma, 2)
+    lcl = round(mu - 3 * sigma, 2)
+    return {
+        'cp': round(cp, 2),
+        'cpk': round(cpk, 2),
+        'mean': round(mu, 2),
+        'std': round(sigma, 2),
+        'ucl': ucl,
+        'lcl': lcl
+    }
