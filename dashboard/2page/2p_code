@@ -1,0 +1,189 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import shap
+from sklearn.inspection import PartialDependenceDisplay, partial_dependence
+from shiny import ui, render
+from common import get_kr_name
+
+def create_defect_analysis_ui(data):
+    """불량 원인 예측 탭 UI 생성"""
+    mold_choices = data['mold_code_choices_top5']
+    numerical_feats = data['numerical_features']
+    
+    return ui.nav_panel(
+        "불량 원인 예측",
+        ui.h3("불량 원인 분석 및 변수 영향도"),
+        ui.p("선택된 mold_code에 대해 SHAP 분석과 PDP를 시각화합니다."),
+        
+        ui.input_select("target_mold", "금형 코드 선택", 
+                        choices={str(code): f"금형코드 {code}" for code in mold_choices},
+                        selected=str(mold_choices[0])),
+        
+        ui.input_select("target_feature", "PDP 변수 선택", 
+                        choices={k: get_kr_name(k) for k in numerical_feats}, 
+                        selected="sleeve_temperature"),
+        
+        ui.hr(),
+        ui.row(
+            ui.column(6, ui.output_plot("mold_defect_plot", height="420px")),
+            ui.column(6, ui.output_plot("shap_summary_plot", height="420px")),
+        ),
+        ui.hr(),
+        ui.output_plot("pdp_plot", height="420px"),
+    )
+
+def create_defect_analysis_server(data):
+    """불량 원인 예측 탭 서버 로직"""
+    
+    def server_logic(input, output, session):
+        
+        @output
+        @render.plot
+        def mold_defect_plot():
+            if data['df_pred'].empty:
+                fig, ax = plt.subplots()
+                ax.text(0.5, 0.5, "데이터 없음", ha="center", va="center")
+                return fig
+            
+            mold_defect = (
+                data['df_pred'].groupby("mold_code")["passorfail"]
+                .mean()
+                .reset_index()
+                .rename(columns={"passorfail": "불량률"})
+                .sort_values("mold_code", ascending=True)
+            )
+            
+            selected_mold = str(input.target_mold())
+            
+            base_color = 'tab:blue'
+            colors = [
+                'red' if str(code) == selected_mold else base_color
+                for code in mold_defect["mold_code"]
+            ]
+            
+            fig, ax = plt.subplots(figsize=(8, 3.5))
+            ax.bar(mold_defect["mold_code"].astype(str), mold_defect["불량률"].values,
+                   color=colors, edgecolor='black', alpha=0.9)
+            ax.set_xticklabels(ax.get_xticklabels(), rotation=45)
+            ax.set_ylabel("불량률")
+            ax.set_title("금형코드별 불량률")
+            fig.tight_layout()
+            return fig
+        
+        @output
+        @render.plot
+        def shap_summary_plot():
+            if not data['data_status']['MODEL_LOADED'] or data['df_pred'].empty:
+                return None
+            
+            target_mold = str(input.target_mold())
+            target_feature_original = input.target_feature()
+            
+            df_seg = data['df_pred'][data['df_pred']["mold_code"].astype(str) == target_mold].copy()
+            if df_seg.empty:
+                fig, ax = plt.subplots()
+                ax.text(0.5, 0.5, f"mold_code {target_mold} 데이터 없음", ha="center", va="center")
+                return fig
+            
+            X_seg = df_seg[data['feature_names']]
+            preprocessor = data['pipeline'].named_steps["preprocessor"]
+            classifier = data['pipeline'].named_steps["classifier"]
+            X_transformed = preprocessor.transform(X_seg)
+            feature_names_trans = list(preprocessor.get_feature_names_out())
+            
+            explainer = shap.TreeExplainer(classifier)
+            shap_values = explainer.shap_values(X_transformed)
+            shap_values_plot = shap_values[1] if isinstance(shap_values, list) else shap_values
+            
+            shap_mean_abs = np.abs(shap_values_plot).mean(axis=0)
+            top_idx = np.argsort(shap_mean_abs)[-10:][::-1]
+            
+            feature_names_top_raw = [feature_names_trans[i] for i in top_idx]
+            feature_basenames_top = [name.split('__')[-1] for name in feature_names_top_raw]
+            feature_names_kr = [get_kr_name(b) for b in feature_basenames_top]
+            
+            colors = ['tab:blue'] * len(feature_basenames_top)
+            if target_feature_original in feature_basenames_top:
+                colors[feature_basenames_top.index(target_feature_original)] = 'red'
+            
+            fig = plt.figure(figsize=(8, 3.5))
+            shap_mean_abs_top = shap_mean_abs[top_idx]
+            y_pos = np.arange(len(feature_names_kr))
+            plt.barh(y_pos, shap_mean_abs_top, color=colors)
+            plt.yticks(y_pos, feature_names_kr)
+            plt.gca().invert_yaxis()
+            plt.title(f"금형코드 {target_mold} - 변수 영향도 TOP10")
+            plt.xlabel("변수 영향도 평균(|SHAP|)", fontsize=12)
+            plt.tight_layout()
+            return fig
+        
+        @output
+        @render.plot
+        def pdp_plot():
+            if not data['data_status']['MODEL_LOADED'] or data['df_pred'].empty:
+                return None
+            
+            target_mold = int(input.target_mold())
+            target_feature = input.target_feature()
+            
+            df_seg = data['df_pred'][data['df_pred']["mold_code"] == target_mold].copy()
+            if df_seg.empty:
+                fig, ax = plt.subplots()
+                ax.text(0.5, 0.5, f"mold_code {target_mold} 데이터 없음", ha="center", va="center")
+                return fig
+            
+            X_seg = df_seg[data['feature_names']]
+            X_seg_sample = X_seg.sample(n=2000, random_state=42) if len(X_seg) > 2000 else X_seg
+            
+            display = PartialDependenceDisplay.from_estimator(
+                estimator=data['pipeline'],
+                X=X_seg_sample,
+                features=[target_feature],
+                kind='average',
+                grid_resolution=50,
+                response_method="predict_proba"
+            )
+            ax = display.axes_[0, 0]
+            
+            pd_res = partial_dependence(
+                estimator=data['pipeline'],
+                X=X_seg_sample,
+                features=[target_feature],
+                kind='average',
+                grid_resolution=50,
+                response_method="predict_proba"
+            )
+            xx = np.asarray(pd_res["grid_values"][0])
+            yy = np.asarray(pd_res["average"][0])
+            
+            xvals = X_seg_sample[target_feature].values
+            edges = np.r_[xx[0], (xx[1:] + xx[:-1]) / 2, xx[-1]]
+            bin_ids = np.digitize(xvals, edges) - 1
+            bin_ids = np.clip(bin_ids, 0, len(xx)-1)
+            counts = np.bincount(bin_ids, minlength=len(xx))
+            
+            MIN_BIN = max(10, int(0.01 * len(X_seg_sample)))
+            dense_mask = counts >= MIN_BIN
+            
+            EPS = 0.001
+            ymin = float(yy.min())
+            mask_good = (yy <= (ymin + EPS)) & dense_mask
+            
+            if mask_good.any():
+                idx = np.where(mask_good)[0]
+                splits = np.where(np.diff(idx) != 1)[0] + 1
+                runs = np.split(idx, splits)
+                best = max(runs, key=len)
+                good_lo, good_hi = xx[best[0]], xx[best[-1]]
+                
+                ax.axvspan(good_lo, good_hi, color="green", alpha=0.20,
+                          label=f"권장 구간 {good_lo:.2f} ≤ x ≤ {good_hi:.2f}")
+            
+            ax.set_title(f"금형코드 {target_mold} - PDP: {get_kr_name(target_feature)}")
+            ax.set_xlabel(get_kr_name(target_feature), fontsize=11)
+            ax.set_ylabel("불량 확률 (predict_proba)", fontsize=11)
+            ax.legend()
+            plt.tight_layout()
+            return display.figure_
+    
+    return server_logic
