@@ -1,0 +1,359 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+train = pd.read_csv('./data/train.csv')
+
+'''
+분석한 컬럼
+Column	Non-Null Count	Dtype
+physical_strength	73611	float64
+Coolant_temperature	73611	float64
+EMS_operation_time	73612	int64
+registration_time	73612	object
+tryshot_signal	1244	object
+mold_code	73612	int64
+heating_furnace	32731	object
+
+'''
+
+
+
+# 수치형 변수의 기본적인 분포를 확인하기 위해 해당 코드를 실행
+
+# 1. physical_strength
+train['physical_strength'].describe()
+
+plt.figure(figsize=(6,4))
+sns.boxplot(y=train['physical_strength'])
+plt.title("Boxplot of physical_strength")
+plt.show()
+
+'''
+대다수의 값에 비해서 이상치가 나와있는 것을 확인할 수 있다 (65535)
+
+해당 값은 이상치라 판단하고 제거한다.
+'''
+train = train[train['physical_strength'] != 65535]
+
+
+# 1-2.  mold_code별 분포
+train['mold_code'].value_counts()
+
+# 확인할 mold_code 리스트
+mold_codes = [8917, 8722, 8412, 8573, 8600]
+
+for code in mold_codes:
+    # 데이터 필터링
+    mold_df = train[train['mold_code'] == code]
+
+    # Boxplot
+    plt.figure(figsize=(4,6))
+    sns.boxplot(y=mold_df['physical_strength'], color="skyblue")
+    plt.title(f"Mold {code} - physical_strength Boxplot", fontsize=14)
+    plt.ylabel("physical_strength")
+    plt.show()
+
+    # 그룹 나누기
+    normal_group = mold_df[mold_df['physical_strength'] >= 600]
+    outlier_group = mold_df[mold_df['physical_strength'] <= 100]
+
+    # passorfail 분포 확인
+    print(f"===== Mold {code} =====")
+    print("=== 정상 범위 (>=600) ===")
+    print(normal_group['passorfail'].value_counts(normalize=True))
+    print("\n=== 아웃라이어 (<=100) ===")
+    print(outlier_group['passorfail'].value_counts(normalize=True))
+    print("\n")
+
+
+# 2. Coolant_Temperature
+train['Coolant_temperature'].describe()
+
+plt.figure(figsize=(6,4))
+sns.boxplot(y=train['Coolant_temperature'])
+plt.title("Boxplot of Coolant_temperature")
+plt.show()
+
+'''
+대다수의 값에 비해서 이상치가 나와있는 것을 확인할 수 있다 (1449) → (9/73612)
+
+해당 값은 이상치라 판단하고 제거한다.
+'''
+
+# 2-2. mold_code 별 분포
+
+# 확인할 mold_code 리스트
+mold_codes = [8917, 8722, 8412, 8573, 8600]
+
+fig, axes = plt.subplots(2, len(mold_codes), figsize=(18, 10), sharey='row')
+
+for i, code in enumerate(mold_codes):
+    mold_df = train[train['mold_code'] == code]
+
+    # 1) Boxplot (위쪽 행)
+    sns.boxplot(y=mold_df['Coolant_temperature'], color="skyblue", ax=axes[0, i])
+    axes[0, i].set_title(f"Mold {code}", fontsize=12)
+    axes[0, i].set_ylabel("Coolant_temperature" if i == 0 else "")
+
+    # 2) Pass/Fail 분포 (아래쪽 행)
+    pass_fail_counts = mold_df['passorfail'].value_counts(normalize=True).sort_index()
+    sns.barplot(x=pass_fail_counts.index.astype(str),
+                y=pass_fail_counts.values,
+                ax=axes[1, i],
+                palette="Set2")
+    axes[1, i].set_ylim(0, 1)  # 비율로 고정
+    axes[1, i].set_title(f"Mold {code} Pass/Fail", fontsize=12)
+    axes[1, i].set_ylabel("Ratio" if i == 0 else "")
+
+plt.suptitle("Coolant Temperature & Pass/Fail by Mold", fontsize=16)
+plt.tight_layout()
+plt.show()
+
+# 3. EMS operation time
+train['EMS_operation_time'].value_counts()
+
+'''
+EMS_operation_time
+23    60745
+6      9088
+3      3454
+25      312
+0         1
+
+type int64으로 되어있으나 범주형으로 변경해야한다.
+'''
+# 3-2 mold_code 별 분포
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# mold_code 리스트 (데이터에 따라 정렬)
+mold_codes = sorted(train['mold_code'].unique())
+n_codes = len(mold_codes)
+
+# subplot 크기 계산 (예: 2행 3열, mold_code 개수에 맞게 자동 배치)
+n_cols = 3
+n_rows = (n_codes + n_cols - 1) // n_cols
+
+fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols*5, n_rows*4))
+
+# 2차원 배열 -> 1차원으로 평탄화
+axes = axes.flatten()
+
+for i, code in enumerate(mold_codes):
+    group = train[train['mold_code'] == code]
+    sns.countplot(x=group["EMS_operation_time"], ax=axes[i])
+    axes[i].set_title(f"Mold {code}", fontsize=12)
+    axes[i].set_xlabel("EMS_operation_time")
+    axes[i].set_ylabel("Count")
+
+# 남는 subplot 제거
+for j in range(i+1, len(axes)):
+    fig.delaxes(axes[j])
+
+plt.suptitle("EMS_operation_time 분포 by Mold Code", fontsize=16)
+plt.tight_layout()
+plt.show()
+
+# 범주형 변수 ( tryshot_signal, Heating_furnace)
+
+# tryshot_signal
+sns.countplot(x='tryshot_signal', hue='passorfail', data=train)
+plt.title("Tryshot signal vs passorfail")
+plt.show()
+
+# heating_furnace
+sns.countplot(x='heating_furnace', hue='passorfail', data=train)
+plt.title("Heating furnace vs passorfail")
+plt.show()
+
+# mold_code
+top_molds = train['mold_code'].value_counts().head(10).index
+subset = train[train['mold_code'].isin(top_molds)]
+
+plt.figure(figsize=(10, 4))
+sns.countplot(x='mold_code', hue='passorfail', data=subset, order=top_molds)
+plt.title("mold_code vs passorfail")
+plt.show()
+
+
+# mold_code에 따른 범주형 분포
+for col in ['tryshot_signal', 'mold_code', 'heating_furnace']:
+    print(train[col].value_counts(normalize=True), "\n")
+
+# NaN을 "Missing"으로 치환해서 카테고리화
+df = train.copy()
+df['heating_furnace'] = df['heating_furnace'].fillna("Missing")
+
+plt.figure(figsize=(12,6))
+sns.countplot(data=df, x="mold_code", hue="heating_furnace")
+
+plt.title("Mold Code별 Heating Furnace 분포 (A/B/Missing)", fontsize=14)
+plt.xlabel("Mold Code")
+plt.ylabel("Count")
+plt.legend(title="Heating Furnace")
+plt.xticks(rotation=45)
+plt.show()
+
+
+# 시계열 데이터 확인
+
+# molten_volume
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import pandas as pd
+
+# 시간 정렬 & datetime 변환
+train = train.sort_values("registration_time")
+train['registration_time'] = pd.to_datetime(train['registration_time'], errors='coerce')
+
+# 이상치 제거 (예: 2767, 635 같은 값들 제외) - 필요 시 수정 가능
+subset = train[~train['molten_volume'].isin([2767, 635])]
+
+# 주 단위로 그룹 나누기
+subset['week'] = subset['registration_time'].dt.to_period('W')
+
+weeks = subset['week'].unique()
+n_weeks = len(weeks)
+
+fig, axes = plt.subplots(n_weeks, 1, figsize=(12, 3*n_weeks), sharey=True)
+
+if n_weeks == 1:
+    axes = [axes]
+
+for i, week in enumerate(weeks):
+    week_data = subset[subset['week'] == week]
+
+    # pass/fail 분리
+    pass_data = week_data[week_data['passorfail'] == 0]
+    fail_data = week_data[week_data['passorfail'] == 1]
+
+    # Pass → 파란색
+    axes[i].scatter(pass_data['registration_time'], pass_data['molten_volume'],
+                    color='blue', label='Pass', s=10, alpha=0.7)
+
+    # Fail → 빨간색
+    axes[i].scatter(fail_data['registration_time'], fail_data['molten_volume'],
+                    color='red', label='Fail', s=10, alpha=0.7)
+
+    axes[i].set_title(f"Molten Volume (Week: {week})")
+    axes[i].set_xlabel("Registration Time")
+    axes[i].set_ylabel("Molten Volume")
+    axes[i].xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+    axes[i].tick_params(axis='x', rotation=45)
+    axes[i].set_ylim(0,150)
+
+    # 첫 번째 subplot에만 범례 표시
+    if i == 0:
+        axes[i].legend()
+
+plt.tight_layout()
+plt.show()
+
+
+# coolant_temperature
+
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import pandas as pd
+
+# 시간 정렬 & datetime 변환
+train = train.sort_values("registration_time")
+train['registration_time'] = pd.to_datetime(train['registration_time'], errors='coerce')
+
+# 이상치 제거 (Coolant_temperature == 1449 제외)
+subset = train[train['Coolant_temperature'] != 1449]
+
+# 주 단위로 그룹 나누기
+subset['week'] = subset['registration_time'].dt.to_period('W')
+
+weeks = subset['week'].unique()
+n_weeks = len(weeks)
+
+fig, axes = plt.subplots(n_weeks, 1, figsize=(12, 3*n_weeks), sharey=True)
+
+if n_weeks == 1:
+    axes = [axes]
+
+for i, week in enumerate(weeks):
+    week_data = subset[subset['week'] == week]
+
+    # pass/fail 분리
+    pass_data = week_data[week_data['passorfail'] == 0]
+    fail_data = week_data[week_data['passorfail'] == 1]
+
+    # Pass → 파란색
+    axes[i].scatter(pass_data['registration_time'], pass_data['Coolant_temperature'],
+                    color='blue', label='Pass', s=10, alpha=0.7)
+
+    # Fail → 빨간색
+    axes[i].scatter(fail_data['registration_time'], fail_data['Coolant_temperature'],
+                    color='red', label='Fail', s=10, alpha=0.7)
+
+    axes[i].set_title(f"Coolant Temperature (Week: {week})")
+    axes[i].set_xlabel("Registration Time")
+    axes[i].set_ylabel("Coolant Temp")
+    axes[i].xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+    axes[i].tick_params(axis='x', rotation=45)
+    axes[i].set_ylim(15,40)
+
+    # 첫 번째 subplot에만 범례 표시
+    if i == 0:
+        axes[i].legend()
+
+plt.tight_layout()
+plt.show()
+
+# sleeve temperature
+
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import pandas as pd
+
+# 시간 정렬 & datetime 변환
+train = train.sort_values("registration_time")
+train['registration_time'] = pd.to_datetime(train['registration_time'], errors='coerce')
+
+# 주 단위로 그룹 나누기
+train['week'] = train['registration_time'].dt.to_period('W')
+
+weeks = train['week'].unique()
+n_weeks = len(weeks)
+
+fig, axes = plt.subplots(n_weeks, 1, figsize=(12, 3*n_weeks), sharey=True)
+
+if n_weeks == 1:
+    axes = [axes]
+
+for i, week in enumerate(weeks):
+    week_data = train[train['week'] == week]
+
+    # pass/fail 분리
+    pass_data = week_data[week_data['passorfail'] == 0]
+    fail_data = week_data[week_data['passorfail'] == 1]
+
+    # Pass → 파란색
+    axes[i].scatter(pass_data['registration_time'], pass_data['sleeve_temperature'],
+                    color='blue', label='Pass', s=10, alpha=0.7)
+
+    # Fail → 빨간색
+    axes[i].scatter(fail_data['registration_time'], fail_data['sleeve_temperature'],
+                    color='red', label='Fail', s=10, alpha=0.7)
+
+    axes[i].set_title(f"Sleeve Temperature (Week: {week})")
+    axes[i].set_xlabel("Registration Time")
+    axes[i].set_ylabel("Sleeve Temp")
+    axes[i].xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+    axes[i].tick_params(axis='x', rotation=45)
+    axes[i].set_ylim(0,750)
+
+    # 첫 번째 subplot에만 범례 표시
+    if i == 0:
+        axes[i].legend()
+
+plt.tight_layout()
+plt.show()
+
+
+
